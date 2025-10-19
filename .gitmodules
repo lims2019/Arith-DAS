@@ -1,0 +1,6 @@
+[submodule "third-party/spdlog"]
+	path = third-party/spdlog
+	url = https://github.com/gabime/spdlog.git
+[submodule "third-party/matplotplusplus"]
+	path = third-party/matplotplusplus
+	url = https://github.com/alandefreitas/matplotplusplus.git
