@@ -220,11 +220,114 @@ class CompressorTree(ABC):
         timeLimit,
         n_processing,
     ):
-        raise NotImplementedError("More code will be released once accepted")
+        """
+        Replication from paper
+            GOMIL: Global Optimization of Multiplier by Integer Linear Programming
+            https://umji.sjtu.edu.cn/~wkqian/papers/Xiao_Qian_Liu_GOMIL_Global_Optimization_of_Multiplier_by_Integer_Linear_Programming.pdf
+        Solver:
+            Pulp framework, use GUROBI_CMD default.
+        alpha and beta: area of ct32 and ct22( defaults are extracted from NangateOpenCellLibrary_typical.lib)
+        """
+        logging.info("Using MIP method for ct_architecture")
+        start_time = time.time()
+        model = pulp.LpProblem(f"gomil-{len(pp)}", pulp.LpMinimize)
+        num_cols = len(pp)
+
+        f = pulp.LpVariable.dicts(
+            "f",
+            [(i, j) for i in range(max_stage_num) for j in range(num_cols)],
+            lowBound=0,
+            cat="Integer",
+        )
+        h = pulp.LpVariable.dicts(
+            "h",
+            [(i, j) for i in range(max_stage_num) for j in range(num_cols)],
+            lowBound=0,
+            cat="Integer",
+        )
+        V = pulp.LpVariable.dicts(
+            "V",
+            [(i, j) for i in range(max_stage_num) for j in range(num_cols)],
+            lowBound=0,
+            cat="Integer",
+        )
+
+        F = pulp.LpVariable("F", lowBound=0, cat="Integer")
+        H = pulp.LpVariable("H", lowBound=0, cat="Integer")
+
+        model += alpha * F + beta * H
+
+        model += (
+            pulp.lpSum(f[(i, j)] for i in range(max_stage_num) for j in range(num_cols))
+            == F
+        )
+        model += (
+            pulp.lpSum(h[(i, j)] for i in range(max_stage_num) for j in range(num_cols))
+            == H
+        )
+
+        for i in range(max_stage_num):
+            for j in range(num_cols):
+                model += 3 * f[(i, j)] + 2 * h[(i, j)] <= V[(i, j)]
+        for j in range(num_cols):
+            model += V[(0, j)] == pp[j]
+        for i in range(1, max_stage_num):
+            model += V[(i, 0)] == V[(i - 1, 0)] - 2 * f[(i - 1, 0)] - h[(i - 1, 0)]
+            for j in range(1, num_cols):
+                model += (
+                    V[(i, j)]
+                    == V[(i - 1, j)]
+                    - 2 * f[(i - 1, j)]
+                    - h[(i - 1, j)]
+                    + f[(i - 1, j - 1)]
+                    + h[(i - 1, j - 1)]
+                )
+        for j in range(num_cols):
+            model += V[(max_stage_num - 1, j)] <= 2
+            model += V[(max_stage_num - 1, j)] >= 1
+
+        solver: pulp.LpSolver_CMD = getattr(pulp, method)(
+            timeLimit=timeLimit,
+            keepFiles=False,
+            msg=True,
+            options=[("Threads", str(n_processing))],
+        )
+
+        model.solve(solver)
+        logging.info("Solver Status:", pulp.LpStatus[model.status])
+        ct_32 = np.zeros_like(pp)
+        ct_22 = np.zeros_like(pp)
+        for j in range(num_cols):
+            for i in range(max_stage_num):
+                ct_32[j] += int(pulp.value(f[(i, j)]))
+                ct_22[j] += int(pulp.value(h[(i, j)]))
+        V_result = np.zeros((max_stage_num, num_cols), dtype=int)
+        for i in range(max_stage_num):
+            for j in range(num_cols):
+                V_result[i, j] = int(pulp.value(V[(i, j)]))
+        end_time = time.time()
+        logging.info(f"Time taken: {end_time - start_time:.2f} seconds")
+
+        compressor_tree = cls(pp, ct_32, ct_22)
+        return compressor_tree
 
     @classmethod
     def ufomac(cls, pp):
-        raise NotImplementedError("More code will be released once accepted")
+        pp = pp.astype(int)
+        ct32 = np.zeros_like(pp).astype(int)
+        ct22 = np.zeros_like(pp).astype(int)
+        carry_num = 0
+        for column_idx in range(len(pp)):
+            num_ports = pp[column_idx] + carry_num
+            if num_ports >= 3:
+                if num_ports % 2 == 0:
+                    ct32[column_idx] = (num_ports - 2) // 2
+                else:
+                    ct32[column_idx] = (num_ports - 3) // 2
+                    ct22[column_idx] = 1
+                carry_num = ct32[column_idx] + ct22[column_idx]
+        ct = cls(pp, ct32, ct22)
+        return ct
 
     def to_dict(self):
         return {
@@ -310,7 +413,99 @@ class CompressorTree(ABC):
         timeLimit,
         keepFiles,
     ):
-        raise NotImplementedError("More code will be released once accepted")
+        """
+        Replication method from paper
+            UFO-MAC: A Unified Framework for Optimization of High-Performance Multipliers and Multiply-Accumulators
+            https://arxiv.org/pdf/2408.06935
+        Solver:
+            Pulp framework, use GUROBI_CMD default.
+        """
+        logging.info("Using MIP method for compressor_assignment")
+        start_time = time.time()
+        model = pulp.LpProblem(f"compressor_assignment_{len(self.pp)}", pulp.LpMinimize)
+
+        num_cols = len(self.pp)
+        F = self.ct32
+        H = self.ct22
+
+        f = pulp.LpVariable.dicts(
+            "f",
+            [(i, j) for i in range(max_stage_num) for j in range(num_cols)],
+            lowBound=0,
+            cat="Integer",
+        )
+        h = pulp.LpVariable.dicts(
+            "h",
+            [(i, j) for i in range(max_stage_num) for j in range(num_cols)],
+            lowBound=0,
+            cat="Integer",
+        )
+        pp = pulp.LpVariable.dicts(
+            "pp",
+            [(i, j) for i in range(max_stage_num) for j in range(num_cols)],
+            lowBound=0,
+            cat="Integer",
+        )
+        y = pulp.LpVariable.dicts(
+            "y",
+            [(i, j) for i in range(max_stage_num) for j in range(num_cols)],
+            cat="Binary",
+        )
+        S = pulp.LpVariable("S", lowBound=0, cat="Integer")
+
+        model += S
+
+        for j in range(num_cols):
+            model += pulp.lpSum(f[(i, j)] for i in range(max_stage_num)) == F[j]
+
+        for j in range(num_cols):
+            model += pulp.lpSum(h[(i, j)] for i in range(max_stage_num)) == H[j]
+
+        for j in range(num_cols):
+            model += pp[(0, j)] == self.pp[j]
+        for i in range(1, max_stage_num):
+            model += pp[(i, 0)] == pp[(i - 1, 0)] - 2 * f[(i - 1, 0)] - h[(i - 1, 0)]
+            for j in range(1, num_cols):
+                model += (
+                    pp[(i, j)]
+                    == pp[(i - 1, j)]
+                    - 2 * f[(i - 1, j)]
+                    - h[(i - 1, j)]
+                    + f[(i - 1, j - 1)]
+                    + h[(i - 1, j - 1)]
+                )
+
+        for i in range(max_stage_num):
+            for j in range(num_cols):
+                model += 3 * f[(i, j)] + 2 * h[(i, j)] <= pp[(i, j)]
+
+        for i in range(max_stage_num):
+            for j in range(num_cols):
+                model += S >= i * y[(i, j)]
+
+        for i in range(max_stage_num):
+            for j in range(num_cols):
+                model += M * y[(i, j)] >= f[(i, j)] + h[(i, j)]
+
+        solver: pulp.LpSolver_CMD = getattr(pulp, method)(
+            timeLimit=timeLimit,
+            keepFiles=keepFiles,
+            msg=True,
+            options=[("Threads", str(n_processing))],
+        )
+        model.solve(solver)
+
+        logging.info("Solver Status:", pulp.LpStatus[model.status])
+        optimal_s = int(pulp.value(S)) + 1
+        f_result = np.zeros((optimal_s, num_cols), dtype=int)
+        h_result = np.zeros((optimal_s, num_cols), dtype=int)
+        for i in range(optimal_s):
+            for j in range(num_cols):
+                f_result[i, j] = int(pulp.value(f[(i, j)]))
+                h_result[i, j] = int(pulp.value(h[(i, j)]))
+        end_time = time.time()
+        logging.info(f"Time taken: {end_time - start_time:.2f} seconds")
+        return f_result, h_result, optimal_s, pulp.LpStatus[model.status]
 
     UFO_MAC_CONSTANT = {
         "FA": {
@@ -341,7 +536,309 @@ class CompressorTree(ABC):
         json_file,
         **kwargs,
     ) -> Tuple[str, List[deque]]:
-        raise NotImplementedError("More code will be released once accepted")
+        """
+        Replication method from paper
+            UFO-MAC: A Unified Framework for Optimization of High-Performance Multipliers and Multiply-Accumulators
+            https://arxiv.org/pdf/2408.06935
+        Solver:
+            Pulp framework, use GUROBI_CMD default.
+
+        0   1   2   3  : t_src_list[s] 这个阶段的 pp 数量
+         Cell Delays   : UFO_MAC_CONSTANT
+        a   b   c   d  : t_list[s] 下个阶段的 pp 数量
+        Internconnect  : Z[s]
+        0'  1'  2'  3' : t_src_list[s+1] next stage
+        """
+        start_time = time.time()
+        slice_size_mat = np.zeros((dec_ct32.shape[0] + 1, dec_ct32.shape[1]), dtype=int)
+        stage_num, col_num = dec_ct32.shape
+
+        slice_size_mat[0, :] = self.pp
+        for s in range(1, stage_num + 1):
+            slice_size_mat[s, 0] = (
+                slice_size_mat[s - 1, 0] - dec_ct32[s - 1, 0] * 2 - dec_ct22[s - 1, 0]
+            )
+            for c in range(1, col_num):
+                slice_size_mat[s, c] = (
+                    slice_size_mat[s - 1, c]
+                    - dec_ct32[s - 1, c] * 2
+                    - dec_ct22[s - 1, c]
+                    + dec_ct32[s - 1, c - 1]
+                    + dec_ct22[s - 1, c - 1]
+                )
+        print(slice_size_mat)
+        print(dec_ct32)
+        print(dec_ct22)
+
+        model = pulp.LpProblem(f"ufomac_router_{method}_{col_num}", pulp.LpMinimize)
+        t_src_list = []
+        t_list = []
+        Z_list = []
+        for s in range(stage_num):
+            t_src_s = []
+            t_s = []
+            Z_s = []
+            for c in range(col_num):
+                slice_size = int(slice_size_mat[s, c])
+                next_slice_size = int(slice_size_mat[s + 1, c])
+                Z = pulp.LpVariable.dicts(
+                    f"Z_{s},{c}",
+                    [
+                        (i, j)
+                        for i in range(next_slice_size)
+                        for j in range(next_slice_size)
+                    ],
+                    cat="Binary",
+                )
+                Z_s.append(Z)
+                t = pulp.LpVariable.dicts(
+                    f"output_delay_{s},{c}",
+                    [i for i in range(next_slice_size)],
+                    cat="Continuous",
+                    lowBound=0,
+                )
+                t_s.append(t)
+                t_src = pulp.LpVariable.dicts(
+                    f"src_delay_{s},{c}",
+                    [i for i in range(slice_size)],
+                    cat="Continuous",
+                    lowBound=0,
+                )
+                t_src_s.append(t_src)
+            Z_list.append(Z_s)
+            t_list.append(t_s)
+            t_src_list.append(t_src_s)
+        M = pulp.LpVariable("M", lowBound=0, cat="Continuous")
+        model += M
+
+        for s in range(stage_num):
+            for c in range(col_num):
+                if c == 0:
+                    last_carry_num = 0
+                else:
+                    last_carry_num = dec_ct32[s, c - 1] + dec_ct22[s, c - 1]
+                for u in range(slice_size_mat[s, c]):
+                    if s == 0:
+                        model += t_src_list[0][c][u] == 0
+                    else:
+                        for v in range(slice_size_mat[s, c]):
+                            model += t_src_list[s][c][u] - t_list[s - 1][c][
+                                v
+                            ] <= Z_constant * (1 - Z_list[s - 1][c][u, v])
+                            model += t_list[s - 1][c][v] - t_src_list[s][c][
+                                u
+                            ] <= Z_constant * (1 - Z_list[s - 1][c][u, v])
+
+                t_src_idx = 0
+                t_sum_idx = last_carry_num
+                t_carry_idx = 0
+                for ct32_idx in range(dec_ct32[s, c]):
+                    model += (
+                        t_list[s][c][t_sum_idx]
+                        >= t_src_list[s][c][t_src_idx]
+                        + self.UFO_MAC_CONSTANT["FA"]["Tas"]
+                    )
+                    model += (
+                        t_list[s][c][t_sum_idx]
+                        >= t_src_list[s][c][t_src_idx + 1]
+                        + self.UFO_MAC_CONSTANT["FA"]["Tbs"]
+                    )
+                    model += (
+                        t_list[s][c][t_sum_idx]
+                        >= t_src_list[s][c][t_src_idx + 2]
+                        + self.UFO_MAC_CONSTANT["FA"]["Tcs"]
+                    )
+                    if c + 1 < col_num:
+                        model += (
+                            t_list[s][c + 1][t_carry_idx]
+                            >= t_src_list[s][c][t_src_idx]
+                            + self.UFO_MAC_CONSTANT["FA"]["Tac"]
+                        )
+                        model += (
+                            t_list[s][c + 1][t_carry_idx]
+                            >= t_src_list[s][c][t_src_idx + 1]
+                            + self.UFO_MAC_CONSTANT["FA"]["Tbc"]
+                        )
+                        model += (
+                            t_list[s][c + 1][t_carry_idx]
+                            >= t_src_list[s][c][t_src_idx + 2]
+                            + self.UFO_MAC_CONSTANT["FA"]["Tcc"]
+                        )
+                    t_src_idx += 3
+                    t_sum_idx += 1
+                    t_carry_idx += 1
+
+                for ct22_idx in range(dec_ct22[s, c]):
+                    model += (
+                        t_list[s][c][t_sum_idx]
+                        >= t_src_list[s][c][t_src_idx]
+                        + self.UFO_MAC_CONSTANT["HA"]["Tas"]
+                    )
+                    model += (
+                        t_list[s][c][t_sum_idx]
+                        >= t_src_list[s][c][t_src_idx + 1]
+                        + self.UFO_MAC_CONSTANT["HA"]["Tcs"]
+                    )
+                    if c + 1 < col_num:
+                        model += (
+                            t_list[s][c + 1][t_carry_idx]
+                            >= t_src_list[s][c][t_src_idx]
+                            + self.UFO_MAC_CONSTANT["HA"]["Tac"]
+                        )
+                        model += (
+                            t_list[s][c + 1][t_carry_idx]
+                            >= t_src_list[s][c][t_src_idx + 1]
+                            + self.UFO_MAC_CONSTANT["HA"]["Tcc"]
+                        )
+                    t_src_idx += 2
+                    t_carry_idx += 1
+                    t_sum_idx += 1
+
+                while t_src_idx < slice_size_mat[s, c]:
+                    model += t_list[s][c][t_sum_idx] == t_src_list[s][c][t_src_idx]
+                    t_sum_idx += 1
+                    t_src_idx += 1
+
+                for u in range(slice_size_mat[s + 1, c]):
+                    model += (
+                        pulp.lpSum(
+                            Z_list[s][c][u, v] for v in range(slice_size_mat[s + 1, c])
+                        )
+                        == 1
+                    )
+                for v in range(slice_size_mat[s + 1, c]):
+                    model += (
+                        pulp.lpSum(
+                            Z_list[s][c][u, v] for u in range(slice_size_mat[s + 1, c])
+                        )
+                        == 1
+                    )
+        for c in range(col_num):
+            for i in range(len(t_list[-1][c])):
+                model += M >= t_list[-1][c][i]
+
+        print(model.objective)
+
+        solver: pulp.LpSolver_CMD = getattr(pulp, method)(
+            timeLimit=timeLimit,
+            keepFiles=keepFiles,
+            msg=True,
+            options=[("Threads", str(n_processing))],
+        )
+        model.solve(solver)
+        end_time = time.time()
+        logging.info(f"Time taken: {end_time - start_time:.2f} seconds")
+
+        if json_file is not None:
+            try:
+                Z_result = []
+                for s in range(stage_num - 1):
+                    Z_s_result = []
+                    for c in range(col_num):
+                        Z = np.zeros(
+                            (slice_size_mat[s + 1, c], slice_size_mat[s + 1, c]), int
+                        )
+                        for u in range(slice_size_mat[s + 1, c]):
+                            for v in range(slice_size_mat[s + 1, c]):
+                                Z[u, v] = int(pulp.value(Z_list[s][c][u, v]))
+                        Z_s_result.append(Z.tolist())
+                    Z_result.append(Z_s_result)
+                with open(json_file, "w") as f:
+                    json.dump(Z_result, f)
+            except Exception as e:
+                logging.error(f"Error saving Z result to {json_file}: {e}")
+
+        v_src = ""
+        wire_set = set()
+
+        def __add_wire_str(wire_name):
+            if wire_name in wire_set:
+                return ""
+            else:
+                wire_set.add(wire_name)
+                return self.declare_wire(wire_name)
+
+        for s in range(stage_num):
+            last_carry_num = 0
+            v_src += f"    // stage {s}\n"
+            for c in range(col_num):
+                for u in range(slice_size_mat[s, c]):
+                    wire_src = f"wire_src_s{s}_c{c}_{u}"
+                    v_src += __add_wire_str(wire_src)
+                    if s == 0:
+                        v_src += f"    assign {wire_src} = pp_{c}[{u}];\n"
+                    else:
+                        for v in range(slice_size_mat[s, c]):
+                            if int(pulp.value(Z_list[s - 1][c][u, v])) == 1:
+                                wire = f"wire_s{s-1}_c{c}_{v}"
+                                break
+                        v_src += __add_wire_str(wire_src)
+                        v_src += f"    assign {wire_src} = {wire};\n"
+
+                if c == 0:
+                    last_carry_num = 0
+                else:
+                    last_carry_num = dec_ct32[s, c - 1] + dec_ct22[s, c - 1]
+
+                t_sum_idx = last_carry_num
+                t_src_idx = 0
+                t_carry_idx = 0
+                for ct32_idx in range(dec_ct32[s, c]):
+                    wire_sum = f"wire_s{s}_c{c}_{t_sum_idx}"
+                    wire_carry = f"wire_s{s}_c{c+1}_{t_carry_idx}"
+                    wire_a = f"wire_src_s{s}_c{c}_{t_src_idx}"
+                    wire_b = f"wire_src_s{s}_c{c}_{t_src_idx+1}"
+                    wire_c = f"wire_src_s{s}_c{c}_{t_src_idx+2}"
+                    v_src += __add_wire_str(wire_a)
+                    v_src += __add_wire_str(wire_b)
+                    v_src += __add_wire_str(wire_c)
+                    v_src += __add_wire_str(wire_sum)
+                    v_src += __add_wire_str(wire_carry)
+                    v_src += self.declare_fa(
+                        f"ct32_s{s}_c{c}_{ct32_idx}",
+                        [wire_a, wire_b, wire_c],
+                        wire_sum,
+                        wire_carry,
+                    )
+                    t_src_idx += 3
+                    t_sum_idx += 1
+                    t_carry_idx += 1
+
+                for ct22_idx in range(dec_ct22[s, c]):
+                    wire_sum = f"wire_s{s}_c{c}_{t_sum_idx}"
+                    wire_carry = f"wire_s{s}_c{c+1}_{t_carry_idx}"
+                    wire_a = f"wire_src_s{s}_c{c}_{t_src_idx}"
+                    wire_c = f"wire_src_s{s}_c{c}_{t_src_idx+1}"
+                    v_src += __add_wire_str(wire_a)
+                    v_src += __add_wire_str(wire_c)
+                    v_src += __add_wire_str(wire_sum)
+                    v_src += __add_wire_str(wire_carry)
+                    v_src += self.declare_ha(
+                        f"ct22_s{s}_c{c}_{ct22_idx}",
+                        [wire_a, wire_c],
+                        wire_sum,
+                        wire_carry,
+                    )
+
+                    t_src_idx += 2
+                    t_carry_idx += 1
+                    t_sum_idx += 1
+
+                while t_src_idx < slice_size_mat[s, c]:
+                    wire_remain = f"wire_s{s}_c{c}_{t_sum_idx}"
+                    wire_src = f"wire_src_s{s}_c{c}_{t_src_idx}"
+                    v_src += __add_wire_str(wire_remain)
+                    v_src += __add_wire_str(wire_src)
+                    v_src += f"    assign {wire_remain} = {wire_src};\n"
+                    t_sum_idx += 1
+                    t_src_idx += 1
+        routed_wire_list = []
+        for c in range(col_num):
+            wire_list = []
+            for u in range(slice_size_mat[-1, c]):
+                wire_list.append(f"wire_s{stage_num-1}_c{c}_{u}")
+            routed_wire_list.append(deque(wire_list))
+        return v_src, routed_wire_list
 
     def domac_router(
         self,
@@ -362,7 +859,316 @@ class CompressorTree(ABC):
         load_from_json=None,
         **kwargs,
     ):
-        raise NotImplementedError("More code will be released once accepted")
+        """
+        Replication method from paper
+            DOMAC: Differentiable Optimization for High-Speed Multipliers and Multiply-Accumulators
+            https://arxiv.org/abs/2503.23943
+        0   1   2   3  : t_src_list[s] 这个阶段的 pp 数量
+         Cell Delays   : UFO_MAC_CONSTANT
+        a   b   c   d  : t_list[s] 下个阶段的 pp 数量
+        Internconnect  : Z[s]
+        0'  1'  2'  3' : t_src_list[s+1] next stage
+        """
+        slice_size_mat = np.zeros((dec_ct32.shape[0] + 1, dec_ct32.shape[1]), dtype=int)
+        stage_num, col_num = dec_ct32.shape
+
+        slice_size_mat[0, :] = self.pp
+        for s in range(1, stage_num + 1):
+            slice_size_mat[s, 0] = (
+                slice_size_mat[s - 1, 0] - dec_ct32[s - 1, 0] * 2 - dec_ct22[s - 1, 0]
+            )
+            for c in range(1, col_num):
+                slice_size_mat[s, c] = (
+                    slice_size_mat[s - 1, c]
+                    - dec_ct32[s - 1, c] * 2
+                    - dec_ct22[s - 1, c]
+                    + dec_ct32[s - 1, c - 1]
+                    + dec_ct22[s - 1, c - 1]
+                )
+        print(slice_size_mat)
+
+        Z_list = []
+        for s in range(stage_num):
+            Z_s = []
+            for c in range(col_num):
+                next_slice_size = int(slice_size_mat[s + 1, c])
+                Z = torch.nn.Parameter(
+                    torch.randn(
+                        (next_slice_size, next_slice_size),
+                        dtype=torch.float32,
+                        device=device,
+                    ),
+                    requires_grad=True,
+                )
+                Z_s.append(Z)
+            Z_list.append(Z_s)
+
+        def _get_wns_tns():
+            t_set = {}
+            t_src_set = {}
+            for s in range(stage_num):
+                for c in range(col_num):
+                    if c == 0:
+                        last_carry_num = 0
+                    else:
+                        last_carry_num = dec_ct32[s, c - 1] + dec_ct22[s, c - 1]
+                    if s == 0:
+                        for u in range(slice_size_mat[s, c]):
+                            t_u = torch.zeros(
+                                (1),
+                                dtype=torch.float32,
+                                device=device,
+                            )
+                            t_src_set[f"{s}_{c}_{u}"] = t_u
+                        t_src = torch.concatenate(
+                            [
+                                t_src_set[f"{s}_{c}_{u}"]
+                                for u in range(slice_size_mat[s, c])
+                            ]
+                        )
+                    else:
+                        t = torch.stack(
+                            [
+                                t_set[f"{s-1}_{c}_{u}"]
+                                for u in range(slice_size_mat[s, c])
+                            ]
+                        )
+                        t_src = torch.softmax(Z_list[s - 1][c], dim=-1).T @ t
+
+                    t_src_idx = 0
+                    t_sum_idx = last_carry_num
+                    t_carry_idx = 0
+                    for ct32_idx in range(dec_ct32[s, c]):
+                        t_as = t_src[t_src_idx] + self.UFO_MAC_CONSTANT["FA"]["Tas"]
+                        t_bs = t_src[t_src_idx + 1] + self.UFO_MAC_CONSTANT["FA"]["Tbs"]
+                        t_cs = t_src[t_src_idx + 2] + self.UFO_MAC_CONSTANT["FA"]["Tcs"]
+                        t_sum = lse_gamma(torch.stack([t_as, t_bs, t_cs]), gamma)
+                        t_set[f"{s}_{c}_{t_sum_idx}"] = t_sum
+                        if c + 1 < col_num:
+                            t_ac = t_src[t_src_idx] + self.UFO_MAC_CONSTANT["FA"]["Tac"]
+                            t_bc = (
+                                t_src[t_src_idx + 1]
+                                + self.UFO_MAC_CONSTANT["FA"]["Tbc"]
+                            )
+                            t_cc = (
+                                t_src[t_src_idx + 2]
+                                + self.UFO_MAC_CONSTANT["FA"]["Tcc"]
+                            )
+                            t_carry = lse_gamma(torch.stack([t_ac, t_bc, t_cc]), gamma)
+                            t_set[f"{s}_{c+1}_{t_carry_idx}"] = t_carry
+                        t_src_idx += 3
+                        t_sum_idx += 1
+                        t_carry_idx += 1
+                    for ct22_idx in range(dec_ct22[s, c]):
+                        t_as = t_src[t_src_idx] + self.UFO_MAC_CONSTANT["HA"]["Tas"]
+                        t_cs = t_src[t_src_idx + 1] + self.UFO_MAC_CONSTANT["HA"]["Tcs"]
+                        t_sum = lse_gamma(torch.stack([t_as, t_cs]), gamma)
+                        t_set[f"{s}_{c}_{t_sum_idx}"] = t_sum
+                        if c + 1 < col_num:
+                            t_ac = t_src[t_src_idx] + self.UFO_MAC_CONSTANT["HA"]["Tac"]
+                            t_cc = (
+                                t_src[t_src_idx + 1]
+                                + self.UFO_MAC_CONSTANT["HA"]["Tcc"]
+                            )
+                            t_carry = lse_gamma(torch.stack([t_ac, t_cc]), gamma)
+                            t_set[f"{s}_{c+1}_{t_carry_idx}"] = t_carry
+                        t_src_idx += 2
+                        t_carry_idx += 1
+                        t_sum_idx += 1
+                    while t_src_idx < slice_size_mat[s, c]:
+                        t_remain = t_src[t_src_idx]
+                        t_set[f"{s}_{c}_{t_sum_idx}"] = t_remain
+                        t_sum_idx += 1
+                        t_src_idx += 1
+            last_stage_t_list = []
+            for c in range(col_num):
+                for u in range(slice_size_mat[-1, c]):
+                    last_stage_t_list.append(t_set[f"{stage_num-1}_{c}_{u}"])
+            L_WNS = lse_gamma(torch.stack(last_stage_t_list), gamma)
+            L_TNS = torch.sum(torch.stack([t for t in last_stage_t_list], dim=0))
+
+            return L_WNS, L_TNS
+
+        def _get_L_BM():
+            L_BM: torch.Tensor = 0.0
+            for s in range(stage_num):
+                for c in range(col_num):
+                    Z: torch.Tensor = torch.softmax(Z_list[s][c], dim=-1)
+                    for v in range(Z.shape[0]):
+                        L_BM += (1 - torch.sum(Z[:, v])) ** 2
+            return L_BM
+
+        def _get_L_D():
+            L_D: torch.Tensor = 0.0
+            for s in range(stage_num):
+                for c in range(col_num):
+                    Z: torch.Tensor = torch.softmax(Z_list[s][c], dim=-1)
+                    L_D += torch.sum(Z.pow(2) * (1 - Z).pow(2))
+            return L_D
+
+        optim = torch.optim.Adam(
+            [
+                *[Z_list[s][c] for s in range(stage_num) for c in range(col_num)],
+            ],
+            lr=lr,
+        )
+        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optim, T_max=train_steps, eta_min=lr / 10
+        )
+
+        if load_from_json is None:
+            for step in range(train_steps):
+                if step < bm_steps:
+                    L_WNS, L_TNS = _get_wns_tns()
+                    L_BM = _get_L_BM()
+                    L_D = _get_L_D()
+                    loss = (
+                        weight_wns * L_WNS
+                        + weight_tns * L_TNS
+                        + weight_L_D * L_D
+                        + weight_L_BM * L_BM
+                    )
+                else:
+                    L_BM = _get_L_BM()
+                    L_D = _get_L_D()
+                    loss = weight_L_D * L_D + weight_L_BM * L_BM
+
+                optim.zero_grad()
+                loss.backward()
+                optim.step()
+
+                lr_scheduler.step()
+                print(
+                    f"step {step}: loss: {loss.item():.4f}, L_WNS: {L_WNS.item():.4f}, L_TNS: {L_TNS.item():.4f}, L_BM: {L_BM.item():.4f}, L_D: {L_D.item():.4f}"
+                )
+                if tb_logger is not None:
+                    tb_logger.add_scalar("loss", loss.item(), step)
+                    tb_logger.add_scalar("L_WNS", L_WNS.item(), step)
+                    tb_logger.add_scalar("L_TNS", L_TNS.item(), step)
+                    tb_logger.add_scalar("L_BM", L_BM.item(), step)
+                    tb_logger.add_scalar("L_D", L_D.item(), step)
+                    tb_logger.add_scalar("lr", optim.param_groups[0]["lr"], step)
+                    tb_logger.add_scalar("weight_L", weight_L_inc, step)
+                    tb_logger.add_scalar("weight_L_BM", weight_L_BM, step)
+                L_BM = L_BM * (1 + weight_L_inc)
+                L_D = L_D * (1 + weight_L_inc)
+
+            Z_result = []
+            for s in range(stage_num):
+                Z_s_result = []
+                for c in range(col_num):
+                    Z = torch.softmax(Z_list[s][c], dim=-1).cpu().detach().numpy()
+                    Z_s_result.append(Z.tolist())
+                Z_result.append(Z_s_result)
+            if json_file is not None:
+                try:
+                    with open(json_file, "w") as f:
+                        json.dump(Z_result, f)
+                except Exception as e:
+                    logging.error(f"Error saving Z result to {json_file}: {e}")
+        else:
+            print(f"Load from {load_from_json}")
+            with open(load_from_json, "r") as file:
+                routing_info = json.load(file)
+            Z_result = []
+            for s in range(stage_num):
+                Z_s_result = []
+                for c in range(col_num):
+                    Z = routing_info[s][c]
+                    Z_s_result.append(Z)
+                Z_result.append(Z_s_result)
+            
+        v_src = ""
+        wire_set = set()
+
+        def __add_wire_str(wire_name):
+            if wire_name in wire_set:
+                return ""
+            else:
+                wire_set.add(wire_name)
+                return self.declare_wire(wire_name)
+
+        for s in range(stage_num):
+            last_carry_num = 0
+            v_src += f"    // stage {s}\n"
+            for c in range(col_num):
+                Z_arr = np.asarray(Z_result[s - 1][c])
+                for u in range(slice_size_mat[s, c]):
+                    wire_src = f"wire_src_s{s}_c{c}_{u}"
+                    v_src += __add_wire_str(wire_src)
+                    if s == 0:
+                        v_src += f"    assign {wire_src} = pp_{c}[{u}];\n"
+                    else:
+                        v = np.argmax(Z_arr[u, :])
+                        Z_arr[:, v] = -1
+                        v_src += __add_wire_str(wire_src)
+                        wire = f"wire_s{s-1}_c{c}_{v}"
+                        v_src += f"    assign {wire_src} = {wire};\n"
+
+                if c == 0:
+                    last_carry_num = 0
+                else:
+                    last_carry_num = dec_ct32[s, c - 1] + dec_ct22[s, c - 1]
+
+                t_sum_idx = last_carry_num
+                t_src_idx = 0
+                t_carry_idx = 0
+                for ct32_idx in range(dec_ct32[s, c]):
+                    wire_sum = f"wire_s{s}_c{c}_{t_sum_idx}"
+                    wire_carry = f"wire_s{s}_c{c+1}_{t_carry_idx}"
+                    wire_a = f"wire_src_s{s}_c{c}_{t_src_idx}"
+                    wire_b = f"wire_src_s{s}_c{c}_{t_src_idx+1}"
+                    wire_c = f"wire_src_s{s}_c{c}_{t_src_idx+2}"
+                    v_src += __add_wire_str(wire_a)
+                    v_src += __add_wire_str(wire_b)
+                    v_src += __add_wire_str(wire_c)
+                    v_src += __add_wire_str(wire_sum)
+                    v_src += __add_wire_str(wire_carry)
+                    v_src += self.declare_fa(
+                        f"ct32_s{s}_c{c}_{ct32_idx}",
+                        [wire_a, wire_b, wire_c],
+                        wire_sum,
+                        wire_carry,
+                    )
+                    t_src_idx += 3
+                    t_sum_idx += 1
+                    t_carry_idx += 1
+
+                for ct22_idx in range(dec_ct22[s, c]):
+                    wire_sum = f"wire_s{s}_c{c}_{t_sum_idx}"
+                    wire_carry = f"wire_s{s}_c{c+1}_{t_carry_idx}"
+                    wire_a = f"wire_src_s{s}_c{c}_{t_src_idx}"
+                    wire_c = f"wire_src_s{s}_c{c}_{t_src_idx+1}"
+                    v_src += __add_wire_str(wire_a)
+                    v_src += __add_wire_str(wire_c)
+                    v_src += __add_wire_str(wire_sum)
+                    v_src += __add_wire_str(wire_carry)
+                    v_src += self.declare_ha(
+                        f"ct22_s{s}_c{c}_{ct22_idx}",
+                        [wire_a, wire_c],
+                        wire_sum,
+                        wire_carry,
+                    )
+
+                    t_src_idx += 2
+                    t_carry_idx += 1
+                    t_sum_idx += 1
+
+                while t_src_idx < slice_size_mat[s, c]:
+                    wire_remain = f"wire_s{s}_c{c}_{t_sum_idx}"
+                    wire_src = f"wire_src_s{s}_c{c}_{t_src_idx}"
+                    v_src += __add_wire_str(wire_remain)
+                    v_src += __add_wire_str(wire_src)
+                    v_src += f"    assign {wire_remain} = {wire_src};\n"
+                    t_sum_idx += 1
+                    t_src_idx += 1
+        routed_wire_list = []
+        for c in range(col_num):
+            wire_list = []
+            for u in range(slice_size_mat[-1, c]):
+                wire_list.append(f"wire_s{stage_num-1}_c{c}_{u}")
+            routed_wire_list.append(deque(wire_list))
+        return v_src, routed_wire_list
 
     def random_router(
         self, dec_ct32: np.ndarray, dec_ct22: np.ndarray
@@ -370,7 +1176,6 @@ class CompressorTree(ABC):
         v_src = ""
         stage_num = len(dec_ct32)
         column_num = len(self.pp)
-        # wires for stage 0
         input_wire_list = []
         for column_index in range(column_num):
             wire_list = [
@@ -486,7 +1291,6 @@ class CompressorTree(ABC):
         v_src += f"    output [{column_num-1}:0] out"
         v_src += "\n);\n"
 
-        # wires for stage 0
         input_wire_list = []
         for column_index in range(column_num):
             wire_list = [
